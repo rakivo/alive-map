@@ -1,0 +1,21 @@
+[package]
+name = "alive-map"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mark Tyrkba <marktyrkba456@gmail.com>"]
+license = "MIT"
+description = "An insertion-order-preserving hash map with O(1) `.remove`"
+repository = "https://github.com/rakivo/alive-map"
+keywords = ["hashmap", "indexmap", "ordermap", "no_std"]
+categories = ["data-structures", "no-std"]
+rust-version = "1.68.2"
+
+[features]
+default = []
+
+inline-more = ["hashbrown/inline-more"]
+
+[dependencies.hashbrown]
+version = "0.15.5"
+default-features = false
+features = ["default-hasher"]
