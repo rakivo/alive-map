@@ -170,23 +170,24 @@ where
     /// let mut map = AliveMap::new();
     /// map.insert(1, "a");
     /// assert_eq!(map.get(&1), Some(&"a"));
+    /// assert_eq!(map.insert(1, "b"), Some("a"));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         if let Some(&idx) = self.index_map.get(&key) {
             let entry = &mut self.entries[idx];
 
-            if entry.is_alive() {
+            if let Some(old_value) = entry.take() {
                 entry.value = Some(value);
                 self.unlink(idx);
                 self.link_tail(idx);
+                return Some(old_value)
             } else {
                 entry.value = Some(value);
                 self.alive_count += 1;
                 self.link_tail(idx);
+                return None
             }
-
-            return
         }
 
         // append to the end
@@ -195,6 +196,7 @@ where
         self.index_map.insert(key, idx);
         self.link_tail(idx);
         self.alive_count += 1;
+        None
     }
 
     /// Removes a key from the map, returning its value if it was alive.
@@ -488,7 +490,7 @@ where
             iter.size_hint().0,
             S::default()
         );
-        iter.for_each(|(k, v)| map.insert(k, v));
+        iter.for_each(|(k, v)| _ = map.insert(k, v));
         map
     }
 }
@@ -507,7 +509,7 @@ where
             (iter.size_hint().0 + 1) / 2
         };
         self.reserve(reserve);
-        iter.for_each(move |(k, v)| self.insert(k, v));
+        iter.for_each(move |(k, v)| _ = self.insert(k, v));
     }
 }
 
