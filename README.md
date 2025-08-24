@@ -29,17 +29,18 @@ who cares about RAM in 2025?
 ## Per-entry overhead:
 
 - std HashMap: ~24 B per entry (bucket pointer, hash, metadata)
-- AliveMap: ~49–57 B per entry
-  - prev pointer: 16 B
-  - next pointer: 16 B
-  - Option discriminant for value: ~4-8 B
+- AliveMap: ~32 B per entry
+  - key: sizeof(key)
+  - value: sizeof(value)
+  - prev pointer: 8 B
+  - next pointer: 8 B
+  - `.aliveness` tag: ~0-1 bit
   - `.index_map` entry (key -> usize): ~sizeof(K) + 8 B
 
 Additional overhead:
 
-- entries Vec metadata: 24 B (pointer + length + capacity)
-- Vec over-allocation: ~25–50% of capacity (unused slots)
-- index_map: HashMap overhead (buckets, hashes, metadata)
+- `.entries` Vec metadata: 24 B (pointer + length + capacity)
+- `.index_map`: HashMap overhead (buckets, hashes, metadata)
 
 # Examples
 
