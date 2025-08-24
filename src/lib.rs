@@ -27,6 +27,7 @@ use core::iter::{FromIterator, FusedIterator};
 
 use alloc::vec::Vec;
 
+use bitvec::prelude::BitVec;
 use hashbrown::{HashMap, DefaultHashBuilder};
 
 /// A key-value entry in an `AliveMap`.
@@ -37,95 +38,16 @@ pub struct Entry<K, V> {
     key: K,
     __value: MaybeUninit<V>,
 
-    alive: bool,
-
     // doubly linked list pointers (indexes into entries vec)
     prev: Option<NonZeroUsize>,
     next: Option<NonZeroUsize>
-}
-
-impl<K, V> Clone for Entry<K, V>
-where
-    K: Clone,
-    V: Clone
-{
-    #[inline]
-    fn clone(&self) -> Self {
-        let __value = if self.alive {
-            // SAFETY: we just checked that this entry is alive
-            MaybeUninit::new(unsafe {
-                self.__value.assume_init_read().clone()
-            })
-        } else {
-            MaybeUninit::uninit()
-        };
-
-        Self {
-            __value,
-            prev: self.prev,
-            next: self.next,
-            alive: self.alive,
-            key: self.key.clone(),
-        }
-    }
-}
-
-impl<K, V> Drop for Entry<K, V> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.alive {
-            // SAFETY: if alive is true, value is initialized
-            unsafe { self.__value.assume_init_drop(); }
-        }
-    }
 }
 
 impl<K, V> Entry<K, V> {
     #[inline(always)]
     const fn new(key: K, __value: V) -> Self {
         let __value = MaybeUninit::new(__value);
-        Self { key, __value, prev: None, next: None, alive: true }
-    }
-
-    #[inline(always)]
-    const fn is_alive(&self) -> bool {
-        self.alive
-    }
-
-    #[inline(always)]
-    fn set_value(&mut self, value: V) {
-        self.__value.write(value);
-        self.alive = true;
-    }
-
-    #[inline(always)]
-    const fn take(&mut self) -> Option<V> {
-        if !self.is_alive() { return None }
-
-        self.alive = false;
-
-        // SAFETY: if alive was true, value is initialized
-        Some(unsafe { self.__value.assume_init_read() })
-    }
-
-    #[inline(always)]
-    const fn value(&self) -> Option<&V> {
-        if self.is_alive() {
-            // SAFETY: if alive is true, value is initialized
-            Some(unsafe { self.__value.assume_init_ref() })
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    const fn value_mut(&mut self) -> Option<&mut V> {
-        if self.is_alive() {
-            // SAFETY: if alive is true, value is initialized
-            Some(unsafe { self.__value.assume_init_mut() })
-        } else {
-            None
-        }
+        Self { key, __value, prev: None, next: None }
     }
 }
 
@@ -147,6 +69,7 @@ const fn z_to_nonz_(zero_idx: usize) -> NonZeroUsize {
 pub struct AliveMap<K, V, S = DefaultHashBuilder> {
     index_map: HashMap<K, usize, S>, // key -> index in entries
     entries: Vec<Entry<K, V>>, // all entries in insertion order
+    aliveness: BitVec,
 
     // doubly linked list of alive entries
     head: Option<NonZeroUsize>, // first alive entry
@@ -163,6 +86,7 @@ impl<K, V> AliveMap<K, V, DefaultHashBuilder> {
     #[inline]
     pub fn new() -> Self {
         Self {
+            aliveness: BitVec::new(),
             index_map: HashMap::new(),
             head: None,
             tail: None,
@@ -180,6 +104,7 @@ impl<K, V> AliveMap<K, V, DefaultHashBuilder> {
         Self {
             head: None,
             tail: None,
+            aliveness: BitVec::with_capacity(n),
             index_map: HashMap::with_capacity(n),
             entries: Vec::with_capacity(n),
             alive_count: 0,
@@ -204,6 +129,7 @@ where
     #[inline]
     pub fn with_capacity_and_hasher(n: usize, h: S) -> Self {
         Self {
+            aliveness: BitVec::with_capacity(n),
             index_map: HashMap::with_capacity_and_hasher(n, h),
             entries: Vec::with_capacity(n),
             alive_count: 0,
@@ -211,6 +137,113 @@ where
             tail: None
         }
     }
+
+    /* ------------------------
+       Private helpers (aliveness-aware)
+       ------------------------ */
+
+    #[inline(always)]
+    fn ensure_aliveness_len(&mut self, idx: usize) {
+        if idx >= self.aliveness.len() {
+            // resize to idx+1 with false bits
+            self.aliveness.resize(idx + 1, false);
+        }
+    }
+
+    #[inline(always)]
+    fn entry_is_alive(&self, idx: usize) -> bool {
+        self.aliveness.get(idx).map(|b| *b).unwrap_or(false)
+    }
+
+    #[inline(always)]
+    fn mark_entry_alive(&mut self, idx: usize) {
+        self.ensure_aliveness_len(idx);
+        // BitVec supports indexed assignment via proxy
+        self.aliveness.set(idx, true);
+    }
+
+    #[inline(always)]
+    fn mark_entry_dead(&mut self, idx: usize) {
+        if idx < self.aliveness.len() {
+            self.aliveness.set(idx, false);
+        }
+    }
+
+    #[inline(always)]
+    fn entry_value_clone(&self, idx: usize) -> MaybeUninit<V>
+    where
+        V: Clone
+    {
+        if self.entry_is_alive(idx) {
+            let v_clone = unsafe {
+                self.entries[idx].__value.assume_init_ref()
+            }.clone();
+            MaybeUninit::new(v_clone)
+        } else {
+            MaybeUninit::uninit()
+        }
+    }
+
+    #[inline]
+    fn entries_clone(&self) -> Vec<Entry<K, V>>
+    where
+        V: Clone
+    {
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let v = self.entry_value_clone(idx);
+            let e = Entry {
+                key: entry.key.clone(),
+                __value: v,
+                prev: entry.prev,
+                next: entry.next
+            };
+            entries.push(e);
+        }
+
+        entries
+    }
+
+    /// Set the value in slot `idx` and mark it alive. Overwrites whatever was there.
+    #[inline(always)]
+    fn entry_set_value(&mut self, idx: usize, value: V) {
+        // write new value (assumes caller handled previous initialization if needed)
+        unsafe { self.entries[idx].__value.as_mut_ptr().write(value) };
+        self.mark_entry_alive(idx);
+    }
+
+    /// Take the value at `idx` if alive; mark dead and return the value.
+    #[inline(always)]
+    fn entry_take(&mut self, idx: usize) -> Option<V> {
+        if !self.entry_is_alive(idx) { return None }
+        self.mark_entry_dead(idx);
+        // SAFETY: we just checked it was alive
+        Some(unsafe { self.entries[idx].__value.assume_init_read() })
+    }
+
+    #[inline(always)]
+    fn entry_value(&self, idx: usize) -> Option<&V> {
+        if self.entry_is_alive(idx) {
+            // SAFETY: if alive is true, value is initialized
+            Some(unsafe { self.entries[idx].__value.assume_init_ref() })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn entry_value_mut(&mut self, idx: usize) -> Option<&mut V> {
+        if self.entry_is_alive(idx) {
+            // SAFETY: if alive is true, value is initialized
+            Some(unsafe { self.entries[idx].__value.assume_init_mut() })
+        } else {
+            None
+        }
+    }
+
+    /* ------------------------
+       Public API (uses the helpers)
+       ------------------------ */
 
     /// Inserts a key-value pair into the map.
     ///
@@ -230,15 +263,13 @@ where
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         if let Some(&idx) = self.index_map.get(&key) {
-            let entry = &mut self.entries[idx];
-
-            if let Some(old_value) = entry.take() {
-                entry.set_value(value);
+            if let Some(old_value) = self.entry_take(idx) {
+                self.entry_set_value(idx, value);
                 self.unlink(idx);
                 self.link_tail(idx);
                 return Some(old_value)
             } else {
-                entry.set_value(value);
+                self.entry_set_value(idx, value);
                 self.alive_count += 1;
                 self.link_tail(idx);
                 return None
@@ -248,6 +279,8 @@ where
         // append to the end
         let idx = self.entries.len();
         self.entries.push(Entry::new(key.clone(), value));
+        self.ensure_aliveness_len(idx);
+        self.aliveness.set(idx, true);
         self.index_map.insert(key, idx);
         self.link_tail(idx);
         self.alive_count += 1;
@@ -272,9 +305,10 @@ where
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let idx = *self.index_map.get(key)?;
 
-        let value = self.entries[idx].take()?;
+        let value = self.entry_take(idx)?;
 
         self.unlink(idx);
+        self.aliveness.set(idx, false);
         self.alive_count -= 1;
 
         Some(value)
@@ -284,32 +318,29 @@ where
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn get(&self, key: &K) -> Option<&V> {
         self.index_map.get(key).and_then(|&idx| {
-            let entry = &self.entries[idx];
-            if entry.is_alive() {
-                entry.value()
+            if self.entry_is_alive(idx) {
+                self.entry_value(idx)
             } else {
                 None
             }
         })
+    }
+
+    /// Returns a mutable reference to the value corresponding to the key, if it is alive.
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        let idx = *self.index_map.get(key)?;
+        if self.entry_is_alive(idx) {
+            self.entry_value_mut(idx)
+        } else {
+            None
+        }
     }
 
     /// Returns `true` if the map contains a value for the specified key.
     #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         self.get(key).is_some()
-    }
-
-    /// Returns a mutable reference to the value corresponding to the key, if it is alive.
-    #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.index_map.get(key).and_then(|&idx| {
-            let entry = &mut self.entries[idx];
-            if entry.is_alive() {
-                entry.value_mut()
-            } else {
-                None
-            }
-        })
     }
 
     /// Returns the number of alive entries in the map.
@@ -371,8 +402,10 @@ where
 
         let old_head = self.head;
         let old_entries = mem::take(&mut self.entries);
+        let old_aliveness = mem::take(&mut self.aliveness);
 
         let mut new_entries = Vec::with_capacity(self.alive_count);
+        let mut new_aliveness = BitVec::with_capacity(self.alive_count);
 
         self.index_map.clear();
         self.head = None;
@@ -380,8 +413,11 @@ where
 
         let mut curr = old_head;
         while let Some(old_idx) = curr {
-            let old_entry = &old_entries[nonz_to_z_(old_idx)];
-            if !old_entry.is_alive() {
+            let old_idx_usize = nonz_to_z_(old_idx);
+            let old_entry = &old_entries[old_idx_usize];
+
+            // Check alive using old_aliveness
+            if !old_aliveness.get(old_idx_usize).map(|b| *b).unwrap_or(false) {
                 curr = old_entry.next;
                 continue
             }
@@ -394,16 +430,18 @@ where
                 Some(new_idx - 1)
             };
 
+            // SAFETY: we know this old slot was alive, so value is initialized
+            let v_clone = unsafe { old_entry.__value.assume_init_ref() }.clone();
+
             new_entries.push(Entry {
                 key: old_entry.key.clone(),
-                __value: MaybeUninit::new(
-                    // SAFETY: if alive was true, value is initialized
-                    unsafe { old_entry.__value.assume_init_ref() }.clone()
-                ),
+                __value: MaybeUninit::new(v_clone),
                 prev: prev_idx.map(z_to_nonz_),
                 next: None,
-                alive: true
             });
+
+            // new entry is alive
+            new_aliveness.push(true);
 
             let znew_idx = z_to_nonz_(new_idx);
 
@@ -424,6 +462,7 @@ where
         }
 
         self.entries = new_entries;
+        self.aliveness = new_aliveness;
     }
 
     /// Reserves capacity for at least `additional` more alive entries.
@@ -516,14 +555,16 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(idx) = self.curr {
-            let entry = &self.entries[nonz_to_z_(idx)];
-            self.curr = entry.next;
-            self.remaining -= 1;
-            Some((&entry.key, entry.value().unwrap()))
-        } else {
-            None
-        }
+        if self.remaining == 0 { return None }
+
+        let idx = self.curr?;
+        let entry = &self.entries[nonz_to_z_(idx)];
+        self.curr = entry.next;
+        self.remaining -= 1;
+
+        // SAFETY: entry is alive
+        let val_ref = unsafe { entry.__value.assume_init_ref() };
+        Some((&entry.key, val_ref))
     }
 
     #[inline(always)]
@@ -598,9 +639,24 @@ where
             head: self.head,
             tail: self.tail,
             index_map: self.index_map.clone(),
-            entries: self.entries.clone(),
+            entries: self.entries_clone(),
+            aliveness: self.aliveness.clone(),
             alive_count: self.alive_count
         }
+    }
+}
+
+impl<K, V, S> Drop for AliveMap<K, V, S> {
+    fn drop(&mut self) {
+        // Drop any initialized V values before entries are dropped.
+        for i in 0..self.entries.len() {
+            if self.aliveness.get(i).map(|b| *b).unwrap_or(false) {
+                // SAFETY: aliveness bit says this entry is initialized
+                unsafe { self.entries[i].__value.assume_init_drop(); }
+            }
+            // keys will be dropped automatically as part of Entry drop
+        }
+        // other fields (Vec, HashMap, BitVec) drop naturally
     }
 }
 
