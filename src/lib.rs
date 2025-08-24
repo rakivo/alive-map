@@ -19,8 +19,9 @@
 
 extern crate alloc;
 
-use core::{fmt, mem};
-use core::ops::{Deref, DerefMut};
+use core::fmt;
+use core::num::NonZeroUsize;
+use core::mem::{self, MaybeUninit};
 use core::hash::{Hash, BuildHasher};
 use core::iter::{FromIterator, FusedIterator};
 
@@ -32,28 +33,15 @@ use hashbrown::{HashMap, DefaultHashBuilder};
 ///
 /// Contains the key, optional value, and a flag indicating if the entry is alive.
 #[derive(Debug)]
-struct Entry<K, V> {
+pub struct Entry<K, V> {
     key: K,
-    value: Option<V>,
+    __value: MaybeUninit<V>,
+
+    alive: bool,
 
     // doubly linked list pointers (indexes into entries vec)
-    prev: Option<usize>,
-    next: Option<usize>
-}
-
-impl<K, V> Deref for Entry<K, V> {
-    type Target = Option<V>;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
-
-impl<K, V> DerefMut for Entry<K, V> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.value
-    }
+    prev: Option<NonZeroUsize>,
+    next: Option<NonZeroUsize>
 }
 
 impl<K, V> Clone for Entry<K, V>
@@ -63,26 +51,93 @@ where
 {
     #[inline]
     fn clone(&self) -> Self {
+        let __value = if self.alive {
+            // SAFETY: we just checked that this entry is alive
+            MaybeUninit::new(unsafe {
+                self.__value.assume_init_read().clone()
+            })
+        } else {
+            MaybeUninit::uninit()
+        };
+
         Self {
+            __value,
             prev: self.prev,
             next: self.next,
+            alive: self.alive,
             key: self.key.clone(),
-            value: self.value.clone(),
+        }
+    }
+}
+
+impl<K, V> Drop for Entry<K, V> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.alive {
+            // SAFETY: if alive is true, value is initialized
+            unsafe { self.__value.assume_init_drop(); }
         }
     }
 }
 
 impl<K, V> Entry<K, V> {
     #[inline(always)]
-    const fn new(key: K, value: V) -> Self {
-        let value = Some(value);
-        Self { key, value, prev: None, next: None }
+    const fn new(key: K, __value: V) -> Self {
+        let __value = MaybeUninit::new(__value);
+        Self { key, __value, prev: None, next: None, alive: true }
     }
 
     #[inline(always)]
     const fn is_alive(&self) -> bool {
-        self.value.is_some()
+        self.alive
     }
+
+    #[inline(always)]
+    fn set_value(&mut self, value: V) {
+        self.__value.write(value);
+        self.alive = true;
+    }
+
+    #[inline(always)]
+    const fn take(&mut self) -> Option<V> {
+        if !self.is_alive() { return None }
+
+        self.alive = false;
+
+        // SAFETY: if alive was true, value is initialized
+        Some(unsafe { self.__value.assume_init_read() })
+    }
+
+    #[inline(always)]
+    const fn value(&self) -> Option<&V> {
+        if self.is_alive() {
+            // SAFETY: if alive is true, value is initialized
+            Some(unsafe { self.__value.assume_init_ref() })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    const fn value_mut(&mut self) -> Option<&mut V> {
+        if self.is_alive() {
+            // SAFETY: if alive is true, value is initialized
+            Some(unsafe { self.__value.assume_init_mut() })
+        } else {
+            None
+        }
+    }
+}
+
+#[inline(always)]
+const fn nonz_to_z_(idx: NonZeroUsize) -> usize {
+    idx.get() - 1
+}
+
+#[inline(always)]
+const fn z_to_nonz_(zero_idx: usize) -> NonZeroUsize {
+    // SAFETY: zero_idx + 1 is always >= 1
+    unsafe { NonZeroUsize::new_unchecked(zero_idx + 1) }
 }
 
 /// An insertion-order-preserving hash map that tracks alive entries.
@@ -94,8 +149,8 @@ pub struct AliveMap<K, V, S = DefaultHashBuilder> {
     entries: Vec<Entry<K, V>>, // all entries in insertion order
 
     // doubly linked list of alive entries
-    head: Option<usize>, // first alive entry
-    tail: Option<usize>, // last alive entry
+    head: Option<NonZeroUsize>, // first alive entry
+    tail: Option<NonZeroUsize>, // last alive entry
 
     alive_count: usize,
 }
@@ -178,12 +233,12 @@ where
             let entry = &mut self.entries[idx];
 
             if let Some(old_value) = entry.take() {
-                entry.value = Some(value);
+                entry.set_value(value);
                 self.unlink(idx);
                 self.link_tail(idx);
                 return Some(old_value)
             } else {
-                entry.value = Some(value);
+                entry.set_value(value);
                 self.alive_count += 1;
                 self.link_tail(idx);
                 return None
@@ -231,7 +286,7 @@ where
         self.index_map.get(key).and_then(|&idx| {
             let entry = &self.entries[idx];
             if entry.is_alive() {
-                entry.value.as_ref()
+                entry.value()
             } else {
                 None
             }
@@ -250,7 +305,7 @@ where
         self.index_map.get(key).and_then(|&idx| {
             let entry = &mut self.entries[idx];
             if entry.is_alive() {
-                entry.value.as_mut()
+                entry.value_mut()
             } else {
                 None
             }
@@ -325,7 +380,7 @@ where
 
         let mut curr = old_head;
         while let Some(old_idx) = curr {
-            let old_entry = &old_entries[old_idx];
+            let old_entry = &old_entries[nonz_to_z_(old_idx)];
             if !old_entry.is_alive() {
                 curr = old_entry.next;
                 continue
@@ -341,23 +396,29 @@ where
 
             new_entries.push(Entry {
                 key: old_entry.key.clone(),
-                value: old_entry.value.clone(),
-                prev: prev_idx,
+                __value: MaybeUninit::new(
+                    // SAFETY: if alive was true, value is initialized
+                    unsafe { old_entry.__value.assume_init_ref() }.clone()
+                ),
+                prev: prev_idx.map(z_to_nonz_),
                 next: None,
+                alive: true
             });
 
+            let znew_idx = z_to_nonz_(new_idx);
+
             if let Some(prev) = prev_idx {
-                new_entries[prev].next = Some(new_idx)
+                new_entries[prev].next = Some(znew_idx)
             }
 
             // update index map
             self.index_map.insert(old_entry.key.clone(), new_idx);
 
             if self.head.is_none() {
-                self.head = Some(new_idx)
+                self.head = Some(znew_idx)
             }
 
-            self.tail = Some(new_idx);
+            self.tail = Some(znew_idx);
 
             curr = old_entry.next;
         }
@@ -407,14 +468,14 @@ where
         entry.next = None;
 
         if let Some(prev_idx) = prev {
-            self.entries[prev_idx].next = next
+            self.entries[nonz_to_z_(prev_idx)].next = next
         } else {
             // this was the head
             self.head = next
         }
 
         if let Some(next_idx) = next {
-            self.entries[next_idx].prev = prev
+            self.entries[nonz_to_z_(next_idx)].prev = prev
         } else {
             // this was the tail
             self.tail = prev
@@ -430,8 +491,10 @@ where
         entry.prev = self.tail;
         entry.next = None;
 
+        let idx = z_to_nonz_(idx);
+
         if let Some(tail_idx) = self.tail {
-            self.entries[tail_idx].next = Some(idx)
+            self.entries[nonz_to_z_(tail_idx)].next = Some(idx)
         } else {
             self.head = Some(idx)
         }
@@ -444,7 +507,7 @@ where
 #[derive(Debug)]
 pub struct Iter<'a, K, V> {
     entries: &'a Vec<Entry<K, V>>,
-    curr: Option<usize>,
+    curr: Option<NonZeroUsize>,
     remaining: usize,
 }
 
@@ -454,10 +517,10 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(idx) = self.curr {
-            let entry = &self.entries[idx];
+            let entry = &self.entries[nonz_to_z_(idx)];
             self.curr = entry.next;
             self.remaining -= 1;
-            Some((&entry.key, entry.value.as_ref().unwrap()))
+            Some((&entry.key, entry.value().unwrap()))
         } else {
             None
         }
