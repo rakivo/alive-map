@@ -158,7 +158,6 @@ where
     #[inline(always)]
     fn mark_entry_alive(&mut self, idx: usize) {
         self.ensure_aliveness_len(idx);
-        // BitVec supports indexed assignment via proxy
         self.aliveness.set(idx, true);
     }
 
@@ -169,7 +168,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn entry_value_clone(&self, idx: usize) -> MaybeUninit<V>
     where
         V: Clone
@@ -189,19 +188,15 @@ where
     where
         V: Clone
     {
-        let mut entries = Vec::with_capacity(self.entries.len());
-        for (idx, entry) in self.entries.iter().enumerate() {
+        self.entries.iter().enumerate().map(|(idx, entry)| {
             let v = self.entry_value_clone(idx);
-            let e = Entry {
+            Entry {
                 key: entry.key.clone(),
                 __value: v,
                 prev: entry.prev,
                 next: entry.next
-            };
-            entries.push(e);
-        }
-
-        entries
+            }
+        }).collect()
     }
 
     /// Set the value in slot `idx` and mark it alive. Overwrites whatever was there.
