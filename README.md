@@ -1,5 +1,9 @@
 # `alive-map`
 
+[![Crates.io](https://img.shields.io/crates/v/alive-map.svg)](https://crates.io/crates/alive-map)
+[![Docs.rs](https://docs.rs/alive-map/badge.svg)](https://docs.rs/alive-map)
+[![License](https://img.shields.io/crates/l/alive-map.svg)](https://crates.io/crates/alive-map)
+
 # **WARNING**: Early stage development. APIs are unstable and most likely to change.
 
 An insertion-order-preserving hash map with O(1) `.remove`
