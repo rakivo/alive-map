@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 #![warn(
     anonymous_parameters,
@@ -17,7 +17,8 @@
     variant_size_differences
 )]
 
-extern crate alloc;
+#[cfg(not(feature = "std"))]
+extern crate alloc as std;
 
 use core::fmt;
 use core::num::NonZeroUsize;
@@ -25,7 +26,7 @@ use core::mem::{self, MaybeUninit};
 use core::hash::{Hash, BuildHasher};
 use core::iter::{FromIterator, FusedIterator};
 
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 use bitvec::prelude::BitVec;
 use hashbrown::{HashMap, DefaultHashBuilder};
@@ -693,10 +694,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::format;
 
-    use alloc::vec;
-    use alloc::string::String;
+    use std::vec;
+    use std::format;
+    use std::string::String;
 
     #[test]
     fn test_new_and_default_and_with_capacity() {

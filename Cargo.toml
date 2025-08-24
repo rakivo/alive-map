@@ -13,6 +13,7 @@ rust-version = "1.68.2"
 [features]
 default = []
 
+std = ["bitvec/std"]
 inline-more = ["hashbrown/inline-more"]
 
 [dependencies.bitvec]
